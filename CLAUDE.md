@@ -9,7 +9,7 @@ so it travels with the code across machines and contributors.
 
 **KiriBuild** is the reusable GitHub Action for [Kirigami](https://github.com/php-kirigami/kirigami)
 projects. It makes sure the runner has Node 24+ and the `kiri` CLI available
-(local dependency first, global install as fallback), then runs `kiri export`.
+(local dependency first, global `@kirigami/cli` install as fallback), then runs `kiri export`.
 That's the whole job — **checkout and committing/deploying the export are the
 caller's responsibility** (this changed in v2; v1 also did checkout + commit).
 
@@ -22,7 +22,8 @@ caller's responsibility** (this changed in v2; v1 also did checkout + commit).
 - **Sole author / maintainer:** Maxime Larrivée-Roy.
 - Sits next to the other Kirigami repos as `../kiribuild/` (see the main repo's
   `CLAUDE.md` for the full sibling list). The `kiri` CLI it drives is
-  `@kirigami/kirigami` in `../kirigami/packages/kirigami/`.
+  `@kirigami/cli` in `../kirigami/packages/cli/` since core 3.0.0; before
+  that, `@kirigami/kirigami` itself shipped `kiri`.
 
 ---
 
@@ -60,18 +61,23 @@ Composite steps, in order. The caller has **already checked out** the repo.
    the lockfile, so the caller's `git add -A` commit-back step has nothing to
    pick up); `npm install` otherwise.
 4. **Ensure the Kirigami CLI is available** — if `./node_modules/.bin/kiri` is
-   missing, `npm install -g @kirigami/kirigami@<kirigami-version>` and append
-   `$(npm config get prefix)/bin` to `$GITHUB_PATH`.
+   missing, `npm install -g @kirigami/cli@<cli-version>` (or
+   `@kirigami/kirigami@<kirigami-version>` when that legacy input is set) and
+   append `$(npm config get prefix)/bin` to `$GITHUB_PATH`. With the default
+   path, a project that has `@kirigami/kirigami` but no `@kirigami/cli` in
+   `node_modules` gets a `::warning::` (the global CLI brings its own engine).
 5. **Export** — picks `./node_modules/.bin/kiri` if present else `$(which kiri)`,
-   then runs `node --experimental-wasm-jspi "$KIRI_BIN" export`. The JSPI flag
-   is required by `@kirigami/php-wasm`.
+   then runs `node [--experimental-wasm-jspi] "$KIRI_BIN" export`. The JSPI flag
+   is required by `@kirigami/php-wasm` on Node 24, but Node 26 rejects it (JSPI
+   is on by default there), so it's only passed when `node` accepts it.
 
 ### Inputs
 
 | Name | Default | Notes |
 |---|---|---|
 | `node-version` | `24` | Only used when the runner doesn't already have Node 24+. |
-| `kirigami-version` | `latest` | Only used for the global fallback install. |
+| `cli-version` | `latest` | `@kirigami/cli` version for the global fallback install. |
+| `kirigami-version` | *(empty)* | Legacy: when set, the fallback installs `@kirigami/kirigami@<value>` instead (only < 3.0.0 ships `kiri`). Was `latest` by default before v2.1. |
 
 Removed in v2: `lfs` and `commit-message` (checkout and commit left to the caller).
 
@@ -114,16 +120,26 @@ The `-f` / `--force` is expected — but only ever on the floating major tag.
 `.github/workflows/test.yml` has two jobs, both on every push / PR:
 
 The workflow has a top-level `env: KIRI_GOOD` — the newest `@kirigami/kirigami`
-known to install + export cleanly (currently `1.4.1`; **must be ≥ 1.4.0** now
-that the official templates use the `meta:` block, which older kiri rejects).
+known to install + export cleanly (currently `2.0.0`; **must be ≥ 2.0.0** now
+that the official templates use the top-level `seo:` block, which older kiri
+rejects). 2.0.0 is also the last core release that ships `kiri` itself.
 `latest` has a history of shipping broken, so the gating jobs pin `KIRI_GOOD`
 (the workflow rewrites each staged `package.json`'s `@kirigami/kirigami` to
 `KIRI_GOOD` — and drops any committed lockfile — before the action runs). Bump
 that one line once `latest-canary` has been green for a while — or drop the
 pinning if upstream releases stabilise.
 
+Since core 3.0.0 moved `kiri` into `@kirigami/cli`, two more pins cover the
+current layout: `CLI_GOOD` (`@kirigami/cli`, currently `0.1.0`) and
+`CORE_GOOD` (`@kirigami/kirigami` 3.x, currently `3.0.0`). `KIRI_GOOD` stays
+the known-good version for the legacy layouts (`kirigami-version`, a project
+depending only on `@kirigami/kirigami`).
+
 - **`cli-resolution`** — a matrix over `test/fixtures/site`, a tiny project
-  depending only on `@kirigami/kirigami`. Scenarios: `local-cli`, `global-cli`,
+  depending only on `@kirigami/kirigami`. Scenarios: `local-cli`, `local-cli-package`
+  (fixture depends on `@kirigami/cli@CLI_GOOD` instead), `global-cli`
+  (no dependency: the default fallback installs `@kirigami/cli`, pinned to
+  `CLI_GOOD` through `cli-version`),
   `preinstalled` (asserts `npm install` is skipped, via a sentinel file in
   `node_modules/`), `lockfile` (writes a `package-lock.json` via
   `npm install --package-lock-only` and no `node_modules/`, asserts the action
@@ -132,11 +148,15 @@ pinning if upstream releases stabilise.
   setup-node is skipped by checking `node -v` is still `v24.0.0`),
   `pinned-version` (installs `kirigami-version: 1.1.2` — a non-latest value — and
   asserts that exact version lands and still exports), `latest-canary`
-  (`continue-on-error`, non-blocking — runs `latest`; green ⇒ bump `KIRI_GOOD`).
+  (`continue-on-error`, non-blocking — leaves `kirigami-version` empty, so the
+  default `@kirigami/cli@latest` fallback runs; green ⇒ bump `CLI_GOOD`).
+  `has-node-24` passes `kirigami-version: KIRI_GOOD`, i.e. the legacy path.
   Every full scenario also asserts the core feature surface: layouts, `@stats`
   data file, `<markdown>`, a custom `<uppercase>` tag, a `post_render` hook, the
   image autogenerator (`dist/images/*.webp`), sitemap.
-- **`templates`** — a matrix over the official templates (pinned to `KIRI_GOOD`),
+- **`templates`** — a matrix over the official templates (pinned to
+  `CLI_GOOD` + `CORE_GOOD` when the template depends on `@kirigami/cli`, else
+  to `KIRI_GOOD`, so the job works before and after a template migrates),
   staged at the workspace root and run through the action. Both `template-default`
   (pages + `@kirigami/canva` Sass output + esbuild output + sitemap) and
   `template-demo` (all `features/*` pages, image autogenerator, `<swatches>` tag,

@@ -17,8 +17,18 @@ on:
 # fail outright ("Plugin ... requires @kirigami/kirigami >= 1.4.3"), not just
 # behave differently. `latest-canary` had stayed green, so bumped straight to
 # the current `latest` per the note above instead of the bare 1.4.3 floor.
+# 2.0.0: the official templates now use the top-level `seo:` block (2.0.0
+# merged `meta:`/`jsonld:` into it); 1.5.5 rejects it ("(root) must NOT have
+# additional properties"), failing both `templates` jobs. Last release that
+# still ships `kiri` itself: from 3.0.0 on it lives in @kirigami/cli, so
+# KIRI_GOOD stays the known-good version for the legacy layouts
+# (`kirigami-version`, a project depending only on @kirigami/kirigami).
+# CLI_GOOD / CORE_GOOD are the known-good pair for the current layout
+# (@kirigami/cli + @kirigami/kirigami 3.x).
 env:
-  KIRI_GOOD: "1.5.5"
+  KIRI_GOOD: "2.0.0"
+  CLI_GOOD: "0.1.0"
+  CORE_GOOD: "3.0.0"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -39,7 +49,8 @@ jobs:
           # package.json keeps @kirigami/kirigami → the action installs deps and
           # uses ./node_modules/.bin/kiri
           - scenario: local-cli
-          # dependency stripped → the action falls back to `npm install -g`
+          # dependency stripped → the action falls back to `npm install -g
+          # @kirigami/cli` (pinned to CLI_GOOD through `cli-version`)
           - scenario: global-cli
           # deps already installed by the workflow → the action must NOT reinstall
           - scenario: preinstalled
@@ -49,7 +60,10 @@ jobs:
           - scenario: has-node-24
           # an explicit, non-latest kirigami-version must be the one installed
           - scenario: pinned-version
-          # non-blocking: does the action still work against the current `latest`?
+          # package.json depends on @kirigami/cli (core 3.0.0+ layout) → the
+          # action uses the kiri that @kirigami/cli installs locally
+          - scenario: local-cli-package
+          # non-blocking: does the default global fallback (@kirigami/cli@latest) work?
           - scenario: latest-canary
 
     steps:
@@ -74,6 +88,9 @@ jobs:
             global-cli|has-node-24|pinned-version|latest-canary)
               node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json'));delete p.devDependencies;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
               ;;
+            local-cli-package)
+              node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json'));p.devDependencies={'@kirigami/cli':process.env.CLI_GOOD};fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+              ;;
             preinstalled)
               npm install
               : > node_modules/.kiribuild-sentinel
@@ -88,7 +105,10 @@ jobs:
       - name: Run KiriBuild
         uses: ./.action
         with:
-          kirigami-version: ${{ (matrix.scenario == 'pinned-version' && '1.1.2') || (matrix.scenario == 'latest-canary' && 'latest') || env.KIRI_GOOD }}
+          # global-cli and latest-canary leave kirigami-version empty: the default
+          # @kirigami/cli fallback (CLI_GOOD for global-cli, latest for the canary)
+          kirigami-version: ${{ (matrix.scenario == 'pinned-version' && '1.1.2') || (matrix.scenario != 'latest-canary' && matrix.scenario != 'global-cli' && env.KIRI_GOOD) || '' }}
+          cli-version: ${{ (matrix.scenario == 'global-cli' && env.CLI_GOOD) || 'latest' }}
 
       - name: Assert the fixture was exported, with every core feature
         # pinned-version / latest-canary install a different CLI on purpose —
@@ -129,7 +149,7 @@ jobs:
           find dist -type f | sort
 
       - name: Assert the local CLI was used
-        if: matrix.scenario == 'local-cli' || matrix.scenario == 'preinstalled' || matrix.scenario == 'lockfile'
+        if: matrix.scenario == 'local-cli' || matrix.scenario == 'preinstalled' || matrix.scenario == 'lockfile' || matrix.scenario == 'local-cli-package'
         shell: bash
         run: test -x ./node_modules/.bin/kiri || { echo "::error::local kiri missing"; exit 1; }
 
@@ -155,6 +175,13 @@ jobs:
           command -v kiri >/dev/null || { echo "::error::global kiri not on PATH"; exit 1; }
           [ ! -e ./node_modules/.bin/kiri ] || { echo "::error::unexpected local kiri"; exit 1; }
 
+      - name: Assert the global CLI came from @kirigami/cli
+        if: matrix.scenario == 'latest-canary' || matrix.scenario == 'global-cli'
+        shell: bash
+        run: |
+          npm ls -g @kirigami/cli --depth=0 | grep -q '@kirigami/cli@' \
+            || { echo "::error::@kirigami/cli was not installed globally"; exit 1; }
+
       - name: Assert the pinned kirigami-version was installed and exported
         if: matrix.scenario == 'pinned-version'
         shell: bash
@@ -170,10 +197,10 @@ jobs:
         shell: bash
         run: |
           if [ ! -f dist/index.html ] || ! grep -q 'KiriBuild Fixture' dist/index.html; then
-            echo '::error::latest @kirigami/kirigami produced no usable export — still broken upstream'
+            echo '::error::latest @kirigami/cli produced no usable export — still broken upstream'
             exit 1
           fi
-          echo 'latest @kirigami/kirigami works — bump KIRI_GOOD in this workflow and unpin.'
+          echo 'latest @kirigami/cli works — bump KIRI_GOOD in this workflow and unpin.'
 
       - name: Assert the pre-installed Node was kept (setup-node skipped)
         if: matrix.scenario == 'has-node-24'
@@ -185,7 +212,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # Real-world test: run the action against the official Kirigami templates,
   # which pull in the parts the fixture can't (@kirigami/canva + Sass, esbuild,
-  # the highlight plugin). The staged package.json is pinned to KIRI_GOOD.
+  # the highlight plugin). The staged package.json is pinned to the known-good
+  # versions of the layout the template uses: CLI_GOOD + CORE_GOOD when it
+  # depends on @kirigami/cli, KIRI_GOOD otherwise.
   # ---------------------------------------------------------------------------
   templates:
     name: templates (${{ matrix.template }})
@@ -211,8 +240,8 @@ jobs:
         shell: bash
         run: |
           rsync -a --exclude .git .template/ ./
-          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json'));p.devDependencies['@kirigami/kirigami']=process.env.KIRI_GOOD;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
-          # the KIRI_GOOD pin above desyncs any committed lockfile — drop it so
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json'));const d=p.devDependencies;if(d['@kirigami/cli']){d['@kirigami/cli']=process.env.CLI_GOOD;d['@kirigami/kirigami']=process.env.CORE_GOOD}else{d['@kirigami/kirigami']=process.env.KIRI_GOOD}fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+          # the version pins above desyncs any committed lockfile — drop it so
           # the action installs fresh (its `npm ci` branch is covered by the
           # cli-resolution 'lockfile' scenario instead)
           rm -f package-lock.json npm-shrinkwrap.json
